@@ -6,6 +6,7 @@ use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
+use roaring::bitmap::Iter;
 use roaring::RoaringBitmap;
 use slotmap::{new_key_type, KeyData, SlotMap};
 
@@ -50,11 +51,11 @@ pub struct NodeCollector<Finalizer: FnMut(Handle)> {
     roots: Vec<Handle>,
     current_cycle: Vec<Handle>,
     cycle_buffer: Vec<Vec<Handle>>,
-    finalizer: Option<Finalizer>,
+    finalizer: Finalizer,
 }
 
 impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
-    pub fn new(finalizer: Option<Finalizer>) -> Self {
+    pub fn new(finalizer: Finalizer) -> Self {
         NodeCollector {
             nodes: SlotMap::with_key(),
             roots: vec![],
@@ -65,8 +66,14 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
     }
 
     pub fn make(&mut self) -> Handle {
-        
         self.nodes.insert(NodeHeader::new())
+    }
+
+    pub fn children(&self, h: Handle) -> Vec<Handle> {
+        let n = self.nodes.index(h);
+        n.children.iter().map(|c| {
+            Handle::from(KeyData::from_ffi(c as u64))
+        }).collect()
     }
 
     pub fn append_child(&mut self, parent: Handle, child: Handle) {
@@ -82,10 +89,7 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
     }
 
     fn free(&mut self, handle: Handle) {
-        match &mut self.finalizer {
-            None => {}
-            Some(f) => f(handle)
-        }
+        (self.finalizer)(handle);
         self.nodes.remove(handle).unwrap();
     }
 
@@ -331,7 +335,8 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
-    use crate::NodeCollector;
+    use rand::Rng;
+    use crate::{Handle, NodeCollector};
 
     #[test]
     fn test_basic() {
@@ -339,7 +344,7 @@ mod tests {
         let finalizer_closure = |h| {
             collected.push(h);
         };
-        let mut collector = NodeCollector::new(Some(finalizer_closure));
+        let mut collector = NodeCollector::new(finalizer_closure);
         let a = collector.make();
         let b = collector.make();
         collector.append_child(a, b);
@@ -360,7 +365,7 @@ mod tests {
         let finalizer_closure = |h| {
             collected.push(h);
         };
-        let mut collector = NodeCollector::new(Some(finalizer_closure));
+        let mut collector = NodeCollector::new(finalizer_closure);
         let a = collector.make();
         let b = collector.make();
         collector.append_child(a, b);
@@ -375,5 +380,45 @@ mod tests {
 
         assert!(collected.contains(&b));
         assert!(!collected.contains(&a));
+    }
+
+    fn produce_object_graph(num_objects: usize, max_child_width: usize, num_mutate_cycles : usize) {
+        let mut collector = NodeCollector::new(|_o| {});
+        let mut objs = vec![];
+        // Create objects,
+        for _onum in 0..num_objects {
+            let handle = collector.make();
+            objs.push( handle);
+        }
+
+        for _i in 0..num_mutate_cycles {
+            let mut rng = rand::thread_rng();
+
+            // create random references between them, some of which could (probably) be cycles
+            for o in objs.iter() {
+                let num_children = rng.gen_range(0..max_child_width);
+                for _i in 0..num_children {
+                    let child = objs[rng.gen_range(0..num_objects)];
+                    collector.append_child(*o, child);
+                }
+            }
+
+            // then remove random references between them
+            for o in objs.iter() {
+                let rand_max_removes = rng.gen_range(0..max_child_width);
+                for (i, c) in collector.children(*o).iter().enumerate() {
+                    if i >= rand_max_removes { break };
+                    collector.remove_child(*o, *c);
+                }
+            }
+
+            // and collect any cycles
+            collector.process_cycles();
+        }
+    }
+
+    #[test]
+    fn test_mock_obj_graph() {
+        produce_object_graph(1000, 50, 10);
     }
 }

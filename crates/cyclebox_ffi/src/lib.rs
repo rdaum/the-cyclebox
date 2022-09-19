@@ -23,7 +23,7 @@ extern "C" fn gc_cycle_collect() {
 #[no_mangle]
 extern "C" fn gc_init_storage() {
     INIT.call_once(|| unsafe {
-        *COLLECTOR_GLOBAL.borrow_mut() = Some(Mutex::new(NodeCollector::new(None)));
+        *COLLECTOR_GLOBAL.borrow_mut() = Some(Mutex::new(NodeCollector::new(|_h|{})));
     });
 }
 
