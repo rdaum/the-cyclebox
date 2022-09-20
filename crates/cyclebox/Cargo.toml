@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 slotmap = { version = "1.0.6" }
-roaring = { version = "0.9.0" }
 
 [dev-dependencies]
 criterion = "0.3.6"
@@ -15,7 +14,7 @@ rand = "0.8.5"
 
 [dev-dependencies.pprof]
 version = "0.10.0"
-features =["flamegraph", "criterion"]
+features = ["flamegraph", "criterion"]
 
 [[bench]]
 name = "bench"
