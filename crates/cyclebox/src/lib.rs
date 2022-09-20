@@ -1,13 +1,10 @@
-#![no_std]
-
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
-use roaring::bitmap::Iter;
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use slotmap::{new_key_type, KeyData, SlotMap};
 
 #[derive(Clone, Eq, PartialEq)]
@@ -30,7 +27,7 @@ struct NodeHeader
     crc: u32,
     color: Color,
     buffered: bool,
-    children: RoaringBitmap,
+    children: RoaringTreemap,
 }
 
 impl NodeHeader
@@ -39,27 +36,26 @@ impl NodeHeader
         Self {
             rc: 0,
             crc: 0,
-            color: Color::White,
+            color: Color::Black,
             buffered: false,
-            children: RoaringBitmap::new(), }
+            children: RoaringTreemap::new(),
+        }
     }
 }
 
 // Persistent garbage collected storage for slots.
 pub struct NodeCollector<Finalizer: FnMut(Handle)> {
     nodes: SlotMap<Handle, NodeHeader>,
-    roots: Vec<Handle>,
-    current_cycle: Vec<Handle>,
+    roots: RoaringTreemap,
     cycle_buffer: Vec<Vec<Handle>>,
     finalizer: Finalizer,
 }
 
-impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
+impl<Finalizer: FnMut(Handle)> NodeCollector<Finalizer> {
     pub fn new(finalizer: Finalizer) -> Self {
         NodeCollector {
             nodes: SlotMap::with_key(),
-            roots: vec![],
-            current_cycle: vec![],
+            roots: RoaringTreemap::new(),
             cycle_buffer: vec![],
             finalizer,
         }
@@ -78,54 +74,63 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
 
     pub fn append_child(&mut self, parent: Handle, child: Handle) {
         let parent = self.nodes.index_mut(parent);
-        parent.children.insert(child.0.as_ffi() as u32);
+        parent.children.insert(child.0.as_ffi());
         self.increment(child);
     }
 
     pub fn remove_child(&mut self, parent: Handle, child: Handle) {
+        assert!(self.nodes.contains_key(parent));
         let parent = self.nodes.index_mut(parent);
-        parent.children.remove(child.0.as_ffi() as u32);
+        let child_id = child.0.as_ffi();
+        assert!(parent.children.contains(child_id));
+        parent.children.remove(child_id);
         self.decrement(child);
     }
 
     fn free(&mut self, handle: Handle) {
+        assert!(self.nodes.contains_key(handle));
         (self.finalizer)(handle);
         self.nodes.remove(handle).unwrap();
     }
 
     fn possible_root(&mut self, sn: Handle) {
+        assert!(self.nodes.contains_key(sn));
         self.scan_black(sn);
         let s = self.nodes.index_mut(sn);
         s.color = Color::Purple;
         if !s.buffered {
             s.buffered = true;
-            self.roots.push(sn);
+            self.roots.insert(sn.0.as_ffi());
         }
     }
 
     fn collect_roots(&mut self) {
         let roots = self.roots.to_owned();
+        self.roots.clear();
         for sn in roots {
+            let sn = Handle::from(KeyData::from_ffi(sn));
             let mut s = self.nodes.index_mut(sn);
             if s.color == Color::White {
-                self.current_cycle = vec![];
-                self.collect_white(sn);
-                self.cycle_buffer.push(self.current_cycle.to_owned());
+                let mut current_cycle = vec![];
+                self.collect_white(sn, &mut current_cycle);
+                self.cycle_buffer.push(current_cycle.to_owned());
             } else {
                 s.buffered = false;
             }
         }
     }
 
-    fn collect_white(&mut self, sn: Handle) {
+    fn collect_white(&mut self, sn: Handle, current_cycle: &mut Vec<Handle>) {
         let s = self.nodes.index_mut(sn);
         if s.color == Color::White {
             s.color = Color::Orange;
             s.buffered = true;
-            self.current_cycle.push(sn);
-            let children = self.nodes.get(sn).unwrap().children.clone();
+            current_cycle.push(sn);
+            let children : Vec<u64> = self.nodes.get(sn).unwrap().children.iter().collect();
             for t in children {
-                self.collect_white(Handle::from(KeyData::from_ffi(t as u64)));
+                let handle = Handle::from(KeyData::from_ffi(t));
+                assert!(self.nodes.contains_key(handle));
+                self.collect_white(handle, current_cycle);
             }
         }
     }
@@ -156,18 +161,23 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
     }
 
     fn free_cycles(&mut self) {
-        while !self.cycle_buffer.is_empty() {
-            let c = &self.cycle_buffer.pop().unwrap();
+        let (mut to_free, mut to_refurbish) = (vec![], vec![]);
+        for c in self.cycle_buffer.iter().rev() {
             if self.delta_test(c) && self.sigma_test(c) {
-                self.free_cycle(c);
+                to_free.extend(c);
             } else {
-                self.refurbish(c);
+                to_refurbish.extend(c);
             }
         }
+        self.free_cycle(&to_free);
+        self.refurbish(&to_refurbish);
+
+        self.cycle_buffer = vec![];
     }
 
-    fn delta_test(&mut self, c: &Vec<Handle>) -> bool {
+    fn delta_test(&self, c: &Vec<Handle>) -> bool {
         for n in c {
+            assert!(self.nodes.contains_key(*n));
             let n = self.nodes.index(*n);
             if n.color != Color::Orange {
                 return false;
@@ -176,9 +186,10 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
         true
     }
 
-    fn sigma_test(&mut self, c: &Vec<Handle>) -> bool {
+    fn sigma_test(&self, c: &Vec<Handle>) -> bool {
         let mut extern_rc: u32 = 0;
         for n in c {
+            assert!(self.nodes.contains_key(*n));
             let n = self.nodes.index(*n);
             extern_rc += n.crc;
         }
@@ -188,10 +199,12 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
     fn refurbish(&mut self, c: &Vec<Handle>) {
         let mut first = false;
         for nn in c {
+            assert!(self.nodes.contains_key(*nn));
+
             let n = self.nodes.index_mut(*nn);
             if (first && n.color == Color::Orange) || n.color == Color::Purple {
                 n.color = Color::Purple;
-                self.roots.push(*nn);
+                self.roots.push(nn.0.as_ffi());
             } else {
                 n.color = Color::Black;
                 n.buffered = false;
@@ -229,16 +242,21 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
     }
 
     fn mark_roots(&mut self) {
-        let (to_gray, to_rm_root) = self.roots.iter().partition(|sn| {
-            let s = self.nodes.index(**sn);
+        let (to_gray, to_rm_root) : (RoaringTreemap, RoaringTreemap) = self.roots.iter().partition(|sn| {
+            let sn= Handle::from(KeyData::from_ffi(*sn as u64));
+            assert!(self.nodes.contains_key(sn));
+            let s = self.nodes.index(sn);
             s.color == Color::Purple && s.rc > 0
         });
-        self.roots = to_gray;
-        let roots = self.roots.to_owned();
-        for s in roots {
-            self.mark_gray(s);
+        for s in to_gray.iter() {
+            let sn= Handle::from(KeyData::from_ffi(s as u64));
+
+            self.mark_gray(sn);
         }
+        self.roots = to_gray;
+
         for sn in to_rm_root {
+            let sn= Handle::from(KeyData::from_ffi(sn as u64));
             let s = self.nodes.index_mut(sn);
             s.buffered = false;
             if s.rc == 0 {
@@ -254,16 +272,21 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
             s.crc = s.rc;
             let children = self.nodes.get(sn).unwrap().children.clone();
             for t in children {
-                self.mark_gray(Handle::from(KeyData::from_ffi(t as u64)));
+                let handle = Handle::from(KeyData::from_ffi(t as u64));
+                assert!(self.nodes.contains_key(handle));
+                self.mark_gray(handle);
             }
         } else {
-            s.crc -= 1;
+            s.crc = s.crc.saturating_sub(1);
         }
     }
 
     fn scan_roots(&mut self) {
         let roots = self.roots.to_owned();
         for s in roots {
+            let s = Handle::from(KeyData::from_ffi(s));
+
+            assert!(self.nodes.contains_key(s));
             self.scan(s);
         }
     }
@@ -275,8 +298,12 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
             s.color = Color::White;
             let children = self.nodes.get(sn).unwrap().children.clone();
             for t in children {
-                self.scan(Handle::from(KeyData::from_ffi(t as u64)));
+                let handle = Handle::from(KeyData::from_ffi(t as u64));
+                assert!(self.nodes.contains_key(handle));
+                self.scan(handle);
             }
+        } else {
+            self.scan_black(sn);
         }
     }
 
@@ -284,9 +311,11 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
         let s = self.nodes.index_mut(sn);
         if s.color != Color::Black {
             s.color = Color::Black;
-            let children = self.nodes.get(sn).unwrap().children.clone();
+            let children = &self.nodes.get(sn).unwrap().children.clone();
             for t in children {
-                self.scan_black(Handle::from(KeyData::from_ffi(t as u64)));
+                let handle = Handle::from(KeyData::from_ffi(t as u64));
+                assert!(self.nodes.contains_key(handle));
+                self.scan_black(handle);
             }
         }
     }
@@ -299,9 +328,10 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
 
     pub fn decrement(&mut self, n: Handle) {
         let s = self.nodes.index_mut(n);
+        // s.rc = s.rc.saturating_sub(1);
         s.rc -= 1;
         if s.rc == 0 {
-            self.free(n);
+            self.release(n);
         } else {
             self.possible_root(n);
         }
@@ -310,12 +340,14 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
     pub fn release(&mut self, sn: Handle) {
         let children = self.nodes.get(sn).unwrap().children.clone();
         for t in children {
-            self.decrement(Handle::from(KeyData::from_ffi(t as u64)));
+            let handle = Handle::from(KeyData::from_ffi(t as u64));
+            assert!(self.nodes.contains_key(handle));
+            self.decrement(handle);
         }
         let s = self.nodes.index_mut(sn);
         s.color = Color::Black;
         if !s.buffered {
-            self.nodes.remove(sn);
+            self.free(sn);
         }
     }
 
@@ -335,6 +367,8 @@ impl<Finalizer : FnMut(Handle)>  NodeCollector<Finalizer> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
     use rand::Rng;
     use crate::{Handle, NodeCollector};
 
@@ -382,35 +416,65 @@ mod tests {
         assert!(!collected.contains(&a));
     }
 
-    fn produce_object_graph(num_objects: usize, max_child_width: usize, num_mutate_cycles : usize) {
-        let mut collector = NodeCollector::new(|_o| {});
-        let mut objs = vec![];
-        // Create objects,
+    fn produce_object_graph(num_objects: usize, max_child_width: usize, num_mutate_cycles: usize) {
+        let objs = Arc::new(Mutex::new(HashSet::new()));
+        let mut collector = NodeCollector::new(|o| {
+            objs.lock().unwrap().remove(&o);
+        });
+
+
+        // Create more objects,
         for _onum in 0..num_objects {
             let handle = collector.make();
-            objs.push( handle);
+            collector.increment(handle);
+            objs.lock().unwrap().insert(handle);
         }
 
         for _i in 0..num_mutate_cycles {
             let mut rng = rand::thread_rng();
 
             // create random references between them, some of which could (probably) be cycles
-            for o in objs.iter() {
-                let num_children = rng.gen_range(0..max_child_width);
-                for _i in 0..num_children {
-                    let child = objs[rng.gen_range(0..num_objects)];
-                    collector.append_child(*o, child);
+            {
+                let objs = objs.lock().unwrap();
+                for o in objs.iter() {
+                    let num_children = rng.gen_range(0..max_child_width);
+                    for _i in 0..num_children {
+                        let child = objs.iter().nth(rng.gen_range(0..num_objects));
+                        if child.is_some() {
+                            collector.append_child(*o, *child.unwrap());
+                        }
+                    }
                 }
             }
 
-            // then remove random references between them
-            for o in objs.iter() {
+            let objs_copy: Vec<Handle> = {
+                objs.lock().unwrap().iter().map(|h| {
+                    *h
+                }).collect()
+            };
+
+            for o in objs_copy.iter() {
+
+                let valid_h = {
+                    let x = objs.lock().unwrap();
+                    x.contains(o)
+                };
+                if !valid_h { continue; }
+
                 let rand_max_removes = rng.gen_range(0..max_child_width);
                 for (i, c) in collector.children(*o).iter().enumerate() {
-                    if i >= rand_max_removes { break };
-                    collector.remove_child(*o, *c);
+                    if i >= rand_max_removes { break; };
+                    let valid_child = {
+                        let x = objs.lock().unwrap();
+                        x.contains(o) && x.contains(c)
+                    };
+
+                    if valid_child {
+                        collector.remove_child(*o, *c);
+                    }
                 }
             }
+
 
             // and collect any cycles
             collector.process_cycles();
@@ -418,7 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_obj_graph() {
-        produce_object_graph(1000, 50, 10);
+    fn test_mock_obj_graph()
+    {
+        println!("Entering test");
+        produce_object_graph(1000, 10, 40);
     }
 }

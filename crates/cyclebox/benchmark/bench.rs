@@ -1,42 +1,73 @@
 #[macro_use]
 extern crate criterion;
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use criterion::{BenchmarkId, Criterion};
 use cyclebox::{Handle, NodeCollector};
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 
-struct AnObject {
-    handle: Handle,
-}
-fn produce_object_graph(num_objects: usize, max_child_width: usize, num_mutate_cycles : usize) {
-    let mut collector = NodeCollector::new(|_o| {});
-    let mut objs = vec![];
-    // Create objects,
+
+fn produce_object_graph(num_objects: usize, max_child_width: usize, num_mutate_cycles: usize) {
+    let objs = Arc::new(Mutex::new(HashSet::new()));
+    let mut collector = NodeCollector::new(|o| {
+        objs.lock().unwrap().remove(&o);
+    });
+
+
+    // Create more objects,
     for _onum in 0..num_objects {
         let handle = collector.make();
-        objs.push(AnObject { handle });
+        collector.increment(handle);
+        objs.lock().unwrap().insert(handle);
     }
 
     for _i in 0..num_mutate_cycles {
         let mut rng = rand::thread_rng();
 
-        // then create random references between them, some of which could (probably) be cycles
-        for o in objs.iter() {
-            let num_children = rng.gen_range(0..max_child_width);
-            for _i in 0..num_children {
-                let child = objs[rng.gen_range(0..num_objects)].handle;
-                collector.append_child(o.handle, child);
+        // create random references between them, some of which could (probably) be cycles
+        {
+            let objs = objs.lock().unwrap();
+            for o in objs.iter() {
+                let num_children = rng.gen_range(0..max_child_width);
+                for _i in 0..num_children {
+                    let child = objs.iter().nth(rng.gen_range(0..num_objects));
+                    if child.is_some() {
+                        collector.append_child(*o, *child.unwrap());
+                    }
+                }
             }
         }
 
-        // then remove random references between them
-        for o in objs.iter() {
+        let objs_copy: Vec<Handle> = {
+            objs.lock().unwrap().iter().map(|h| {
+                *h
+            }).collect()
+        };
+
+        for o in objs_copy.iter() {
+
+            let valid_h = {
+                let x = objs.lock().unwrap();
+                x.contains(o)
+            };
+            if !valid_h { continue; }
+
             let rand_max_removes = rng.gen_range(0..max_child_width);
-            for (i, c) in collector.children(o.handle).iter().enumerate() {
-                if i >= rand_max_removes { break };
-                collector.remove_child(o.handle, *c);
+            for (i, c) in collector.children(*o).iter().enumerate() {
+                if i >= rand_max_removes { break; };
+                let valid_child = {
+                    let x = objs.lock().unwrap();
+                    x.contains(o) && x.contains(c)
+                };
+
+                if valid_child {
+                    collector.remove_child(*o, *c);
+                }
             }
         }
+
 
         // and collect any cycles
         collector.process_cycles();
