@@ -13,20 +13,20 @@ static mut COLLECTOR_GLOBAL: Option<Mutex<NodeCollector<Finalizer>>> = None;
 static INIT: Once = Once::new();
 
 #[no_mangle]
-extern "C" fn gc_cycle_collect() {
-    unsafe {
-        let mut cc = COLLECTOR_GLOBAL.as_ref().unwrap().lock().unwrap();
-        cc.process_cycles();
-    }
-}
-
-#[no_mangle]
 extern "C" fn gc_init_storage() {
     INIT.call_once(|| unsafe {
         *COLLECTOR_GLOBAL.borrow_mut() = Some(Mutex::new(NodeCollector::new(|_h|{})));
     });
 }
 
+
+#[no_mangle]
+extern "C" fn gc_cycle_collect() {
+    unsafe {
+        let mut cc = COLLECTOR_GLOBAL.as_ref().unwrap().lock().unwrap();
+        cc.process_cycles();
+    }
+}
 
 #[no_mangle]
 extern "C" fn gc_make_node() -> u64 {

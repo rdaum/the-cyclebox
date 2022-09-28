@@ -7,10 +7,13 @@ edition = "2021"
 
 [dependencies]
 slotmap = { version = "1.0.6" }
+atomic_enum = "0.2.0"
+spin = "0.9.4"
 
 [dev-dependencies]
 criterion = "0.3.6"
 rand = "0.8.5"
+threadpool = "1.8.1"
 
 [dev-dependencies.pprof]
 version = "0.10.0"
