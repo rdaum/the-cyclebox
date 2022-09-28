@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use criterion::Criterion;
 use cyclebox::CollectorOp::{DnCount, UpCount};
-use cyclebox::{CollectorOp, Handle, MemMutResult, NodeCollector, ObjectMemory};
+use cyclebox::{CollectorOp, Handle, MemMutResult, CycleCollector, ObjectMemory, Collector};
 use indexmap::IndexMap;
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
@@ -26,14 +26,14 @@ struct MockDB {
     collected: Vec<Handle>,
 }
 
-static mut COLLECTOR_GLOBAL: Option<NodeCollector<MockDB>> = None;
+static mut COLLECTOR_GLOBAL: Option<CycleCollector<MockDB>> = None;
 static INIT: Once = Once::new();
 
-fn get_collector<'a>() -> &'a NodeCollector<MockDB> {
+fn get_collector<'a>() -> &'a CycleCollector<MockDB> {
     unsafe { COLLECTOR_GLOBAL.as_ref().unwrap() }
 }
 
-fn get_collector_mut<'a>() -> &'a mut NodeCollector<MockDB> {
+fn get_collector_mut<'a>() -> &'a mut CycleCollector<MockDB> {
     unsafe { COLLECTOR_GLOBAL.as_mut().unwrap() }
 }
 
@@ -42,7 +42,7 @@ extern "C" fn gc_create() {
         objects: Default::default(),
         collected: vec![],
     };
-    let collector = NodeCollector::new(objs);
+    let collector = CycleCollector::new(objs);
     INIT.call_once(|| unsafe {
         *COLLECTOR_GLOBAL.borrow_mut() = Some(collector);
     });

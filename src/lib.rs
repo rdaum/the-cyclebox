@@ -12,15 +12,42 @@ use slotmap::{new_key_type, SlotMap};
 use spin::rwlock::RwLockWriteGuard;
 use spin::RwLock;
 
-#[atomic_enum]
-#[derive(Eq, PartialEq)]
-pub enum Color {
-    White,
-    Gray,
-    Black,
-    Orange,
-    Purple,
-    Red,
+pub trait Collector<O: ObjectMemory> {
+    /// Construct an object inside the collector's owned ObjectMemory and register it into the
+    /// collector.
+    /// The collector's ObjectMemory will be called with information about the newly created object
+    fn make(&mut self) -> Handle;
+
+    /// Perform some function with the object memory owned by the collector.
+    /// Function is given an immutable reference to the memory.
+    fn with_memory<F: Fn(&O) -> R, R>(&self, f: F) -> R;
+
+    /// Perform some mutating function with the object memory owned by the collector.
+    /// Function is given an immutable reference to the memory, and should return a series
+    /// of collector operations (e.g. upcount, downcounts) that should be applied by the collector
+    /// after the execution.
+    fn with_memory_mut<F: Fn(&mut O) -> MemMutResult<R>, R>(&mut self, f: F) -> R;
+
+    /// Ask the collector's ObjectMemory for information about the children of a given object.
+    fn children(&self, of: Handle) -> Vec<Handle>;
+
+    /// Increase the reference count of a given object known to the collector.
+    fn increment(&mut self, sn: Handle);
+
+    /// Decreate the reference count of a given object known to the collector.
+    fn decrement(&mut self, n: Handle);
+
+    /// Go through, find any objects being kept alive due to cycles, and clean them, up.
+    fn process_cycles(&mut self);
+}
+
+/// Concurrent, reference counting garbage collector that can collect cycles.
+/// Based on https://pages.cs.wisc.edu/~cymen/misc/interests/Bacon01Concurrent.pdf
+pub struct CycleCollector<O: ObjectMemory> {
+    nodes: RwLock<SlotMap<Handle, NodeHeader>>,
+    roots: RwLock<Vec<Handle>>,
+    cycle_buffer: RwLock<Vec<Vec<Handle>>>,
+    object_memory: RwLock<O>,
 }
 
 new_key_type! { pub struct Handle; }
@@ -28,6 +55,12 @@ impl Handle {
     pub fn id(&self) -> u64 {
         self.0.as_ffi()
     }
+}
+
+pub trait ObjectMemory {
+    fn finalize(&mut self, handle: Handle);
+    fn created(&mut self, handle: Handle) -> Option<Vec<CollectorOp>>;
+    fn children_of(&self, handle: Handle) -> Vec<Handle>;
 }
 
 pub enum CollectorOp {
@@ -64,6 +97,17 @@ impl MemMutResult<()> {
     }
 }
 
+#[atomic_enum]
+#[derive(Eq, PartialEq)]
+enum Color {
+    White,
+    Gray,
+    Black,
+    Orange,
+    Purple,
+    Red,
+}
+
 // The header is kept separate from the object so that they can be kept in a contiguous fashion in
 // the arena so that garbage collection can hopefully be kept in cache, or at least parts of it.
 struct NodeHeader {
@@ -84,99 +128,21 @@ impl NodeHeader {
     }
 }
 
-///
-pub trait ObjectMemory {
-    fn finalize(&mut self, handle: Handle);
-    fn created(&mut self, handle: Handle) -> Option<Vec<CollectorOp>>;
-    fn children_of(&self, handle: Handle) -> Vec<Handle>;
-}
 
-pub struct NodeCollector<O: ObjectMemory> {
-    nodes: RwLock<SlotMap<Handle, NodeHeader>>,
-    roots: RwLock<Vec<Handle>>,
-    cycle_buffer: RwLock<Vec<Vec<Handle>>>,
-    object_memory: RwLock<O>,
-}
+/// We make CycleCollector Send&Sync-able because the locks inside are taking care of making this
+/// (in theory) safe.
+/// This allows for global shared reference to the collector itself without having to stash it
+/// behind an Arc or Mutex, which would defeat the purpose of the whole exercise.
+unsafe impl<O: ObjectMemory> Send for CycleCollector<O> {}
+unsafe impl<O: ObjectMemory> Sync for CycleCollector<O> {}
 
-unsafe impl<O: ObjectMemory> Send for NodeCollector<O> {}
-unsafe impl<O: ObjectMemory> Sync for NodeCollector<O> {}
-
-impl<O: ObjectMemory> NodeCollector<O> {
+impl<O: ObjectMemory> CycleCollector<O> {
     pub fn new(object_memory: O) -> Self {
         Self {
             nodes: RwLock::new(SlotMap::with_key()),
             roots: RwLock::new(Vec::with_capacity(8)),
             cycle_buffer: RwLock::new(Vec::with_capacity(8)),
             object_memory: RwLock::new(object_memory),
-        }
-    }
-
-    pub fn make(&mut self) -> Handle {
-        let handle = { self.nodes.write().insert(NodeHeader::new()) };
-        let result = { self.object_memory.write().created(handle) };
-        if let Some(operations) = result {
-            self.apply_operations(operations);
-        }
-        handle
-    }
-
-    /// Perform some function with the object memory owned by the collector.
-    /// Function is given an immutable reference to the memory.
-    pub fn with_memory<F, R>(&self, f: F) -> R
-    where
-        F: Fn(&O) -> R,
-    {
-        let m = self.object_memory.read();
-        f(&m)
-    }
-
-    /// Perform some mutating function with the object memory owned by the collector.
-    /// Function is given an immutable reference to the memory, and should return a series
-    /// of collector operations (e.g. upcount, downcounts) that should be applied by the collector
-    /// after the execution.
-    pub fn with_memory_mut<F, R>(&mut self, f: F) -> R
-    where
-        F: Fn(&mut O) -> MemMutResult<R>,
-    {
-        let result = {
-            let mut m = self.object_memory.write();
-
-            f(&mut m)
-        };
-        if let Some(operations) = result.operations {
-            self.apply_operations(operations);
-        }
-
-        result.result
-    }
-
-    pub fn children(&self, of: Handle) -> Vec<Handle> {
-        self.object_memory.read().children_of(of)
-    }
-
-    /// Phase 1 (pre epoch boundary)
-    pub fn increment(&mut self, sn: Handle) {
-        {
-            let mut nodes = self.nodes.write();
-            let s = nodes.index_mut(sn);
-
-            s.rc += 1;
-        }
-        self.scan_black(sn);
-    }
-
-    pub fn decrement(&mut self, n: Handle) {
-        let res = {
-            let mut nodes = self.nodes.write();
-            let mut s = nodes.index_mut(n);
-            s.rc -= 1;
-            s.rc == 0
-        };
-        if res {
-            // See comments in Arc about ordering and fence here.
-            self.release(n);
-        } else {
-            self.possible_root(n);
         }
     }
 
@@ -236,14 +202,6 @@ impl<O: ObjectMemory> NodeCollector<O> {
         if !is_buffered {
             self.free(sn);
         }
-    }
-
-    // Phase 2 functions, spawned by epoch boundary
-    /// Invoked once per epoch after increment/decrements have been collected.
-    pub fn process_cycles(&mut self) {
-        self.free_cycles();
-        self.collect_cycles();
-        self.sigma_preparation();
     }
 
     fn collect_roots(&mut self) {
@@ -517,6 +475,80 @@ impl<O: ObjectMemory> NodeCollector<O> {
     }
 }
 
+impl<O: ObjectMemory> Collector<O> for CycleCollector<O> {
+    fn make(&mut self) -> Handle {
+        let handle = { self.nodes.write().insert(NodeHeader::new()) };
+        let result = { self.object_memory.write().created(handle) };
+        if let Some(operations) = result {
+            self.apply_operations(operations);
+        }
+        handle
+    }
+    /// Perform some function with the object memory owned by the collector.
+    /// Function is given an immutable reference to the memory.
+    fn with_memory<F, R>(&self, f: F) -> R
+        where
+            F: Fn(&O) -> R,
+    {
+        let m = self.object_memory.read();
+        f(&m)
+    }
+    /// Perform some mutating function with the object memory owned by the collector.
+    /// Function is given an immutable reference to the memory, and should return a series
+    /// of collector operations (e.g. upcount, downcounts) that should be applied by the collector
+    /// after the execution.
+    fn with_memory_mut<F, R>(&mut self, f: F) -> R
+        where
+            F: Fn(&mut O) -> MemMutResult<R>,
+    {
+        let result = {
+            let mut m = self.object_memory.write();
+
+            f(&mut m)
+        };
+        if let Some(operations) = result.operations {
+            self.apply_operations(operations);
+        }
+
+        result.result
+    }
+    fn children(&self, of: Handle) -> Vec<Handle> {
+        self.object_memory.read().children_of(of)
+    }
+    /// Phase 1 (pre epoch boundary)
+    fn increment(&mut self, sn: Handle) {
+        {
+            let mut nodes = self.nodes.write();
+            let s = nodes.index_mut(sn);
+
+            s.rc += 1;
+        }
+        self.scan_black(sn);
+    }
+    fn decrement(&mut self, n: Handle) {
+        let res = {
+            let mut nodes = self.nodes.write();
+            let mut s = nodes.index_mut(n);
+            s.rc -= 1;
+            s.rc == 0
+        };
+        if res {
+            // See comments in Arc about ordering and fence here.
+            self.release(n);
+        } else {
+            self.possible_root(n);
+        }
+    }
+    // Phase 2 functions, spawned by epoch boundary
+    /// Invoked once per epoch after increment/decrements have been collected.
+    fn process_cycles(&mut self) {
+        self.free_cycles();
+        self.collect_cycles();
+        self.sigma_preparation();
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -532,7 +564,7 @@ mod tests {
     use threadpool::ThreadPool;
 
     use crate::CollectorOp::{DnCount, UpCount};
-    use crate::{CollectorOp, Handle, MemMutResult, NodeCollector, ObjectMemory};
+    use crate::{CollectorOp, Handle, MemMutResult, CycleCollector, ObjectMemory, Collector};
 
     struct TestObj {
         pub children: HashSet<Handle>,
@@ -591,7 +623,7 @@ mod tests {
             objects: Default::default(),
             collected: vec![],
         };
-        let mut collector = NodeCollector::new(mem);
+        let mut collector = CycleCollector::new(mem);
         let a = collector.make();
         collector.increment(a);
         let b = collector.make();
@@ -618,7 +650,7 @@ mod tests {
             objects: Default::default(),
             collected: vec![],
         };
-        let mut collector = NodeCollector::new(mem);
+        let mut collector = CycleCollector::new(mem);
         let a = collector.make();
         collector.increment(a);
         let b = collector.make();
@@ -644,14 +676,14 @@ mod tests {
         assert!(!collector.with_memory(|m| m.collected.contains(&a)));
     }
 
-    static mut COLLECTOR_GLOBAL: Option<NodeCollector<TestMem>> = None;
+    static mut COLLECTOR_GLOBAL: Option<CycleCollector<TestMem>> = None;
     static INIT: Once = Once::new();
 
-    fn get_collector<'a>() -> &'a NodeCollector<TestMem> {
+    fn get_collector<'a>() -> &'a CycleCollector<TestMem> {
         unsafe { COLLECTOR_GLOBAL.as_ref().unwrap() }
     }
 
-    fn get_collector_mut<'a>() -> &'a mut NodeCollector<TestMem> {
+    fn get_collector_mut<'a>() -> &'a mut CycleCollector<TestMem> {
         unsafe { COLLECTOR_GLOBAL.as_mut().unwrap() }
     }
 
@@ -661,7 +693,7 @@ mod tests {
             collected: vec![],
         };
 
-        let collector = NodeCollector::new(objs);
+        let collector = CycleCollector::new(objs);
         INIT.call_once(|| unsafe {
             *COLLECTOR_GLOBAL.borrow_mut() = Some(collector);
         });
