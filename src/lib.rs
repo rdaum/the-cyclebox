@@ -4,18 +4,13 @@ extern crate core;
 use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
-
 use core::ops::{Index, IndexMut};
-
 use std::hash::Hash;
 
-
-
-use spin::RwLock;
 use atomic_enum::atomic_enum;
-
 use slotmap::{new_key_type, SlotMap};
 use spin::rwlock::RwLockWriteGuard;
+use spin::RwLock;
 
 #[atomic_enum]
 #[derive(Eq, PartialEq)]
@@ -35,6 +30,40 @@ impl Handle {
     }
 }
 
+pub enum CollectorOp {
+    UpCount(Handle),
+    DnCount(Handle),
+}
+
+pub struct MemMutResult<R> {
+    result: R,
+    operations: Option<Vec<CollectorOp>>,
+}
+impl<R> MemMutResult<R> {
+    pub fn with_result_and_operations(result: R, operations: Vec<CollectorOp>) -> Self {
+        MemMutResult {
+            result,
+            operations: Some(operations),
+        }
+    }
+    pub fn with_result(result: R) -> Self {
+        MemMutResult {
+            result,
+            operations: None,
+        }
+    }
+}
+
+impl MemMutResult<()> {
+    pub fn with_operations(operations: Vec<CollectorOp>) -> MemMutResult<()> {
+        MemMutResult::<()>::with_result_and_operations((), operations)
+    }
+
+    pub fn unit() -> MemMutResult<()> {
+        MemMutResult::<()>::with_result(())
+    }
+}
+
 // The header is kept separate from the object so that they can be kept in a contiguous fashion in
 // the arena so that garbage collection can hopefully be kept in cache, or at least parts of it.
 struct NodeHeader {
@@ -42,7 +71,6 @@ struct NodeHeader {
     crc: u32,
     color: Color,
     buffered: bool,
-    children: Vec<Handle>,
 }
 
 impl NodeHeader {
@@ -52,17 +80,17 @@ impl NodeHeader {
             crc: 0,
             color: Color::Black,
             buffered: false,
-            children: Vec::new(),
         }
     }
 }
 
+///
 pub trait ObjectMemory {
     fn finalize(&mut self, handle: Handle);
-    fn created(&mut self, handle: Handle);
+    fn created(&mut self, handle: Handle) -> Option<Vec<CollectorOp>>;
+    fn children_of(&self, handle: Handle) -> Vec<Handle>;
 }
 
-// Persistent garbage collected storage for slots.
 pub struct NodeCollector<O: ObjectMemory> {
     nodes: RwLock<SlotMap<Handle, NodeHeader>>,
     roots: RwLock<Vec<Handle>>,
@@ -84,46 +112,46 @@ impl<O: ObjectMemory> NodeCollector<O> {
     }
 
     pub fn make(&mut self) -> Handle {
-        let handle = {
-            self.nodes.write().insert(NodeHeader::new())
-        };
-        self.object_memory.write().created(handle);
+        let handle = { self.nodes.write().insert(NodeHeader::new()) };
+        let result = { self.object_memory.write().created(handle) };
+        if let Some(operations) = result {
+            self.apply_operations(operations);
+        }
         handle
     }
 
-    pub fn with_memory<F, R>(&self, f: F) -> R where F: Fn(&O) -> R {
+    /// Perform some function with the object memory owned by the collector.
+    /// Function is given an immutable reference to the memory.
+    pub fn with_memory<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&O) -> R,
+    {
         let m = self.object_memory.read();
         f(&m)
     }
 
-    pub fn with_memory_mut<F, R>(&self, f: F) -> R where F: Fn(&mut O) -> R {
-        let mut m = self.object_memory.write();
+    /// Perform some mutating function with the object memory owned by the collector.
+    /// Function is given an immutable reference to the memory, and should return a series
+    /// of collector operations (e.g. upcount, downcounts) that should be applied by the collector
+    /// after the execution.
+    pub fn with_memory_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: Fn(&mut O) -> MemMutResult<R>,
+    {
+        let result = {
+            let mut m = self.object_memory.write();
 
-        f(&mut m)
-    }
-
-    pub fn children(&self, h: Handle) -> Vec<Handle> {
-        let nodes = self.nodes.read();
-        let n = nodes.index(h);
-        n.children.to_vec()
-    }
-
-    pub fn append_child(&mut self, parent: Handle, child: Handle) {
-        {
-            let mut nodes = self.nodes.write();
-            let parent = nodes.index_mut(parent);
-            parent.children.push(child);
+            f(&mut m)
+        };
+        if let Some(operations) = result.operations {
+            self.apply_operations(operations);
         }
-        self.increment(child);
+
+        result.result
     }
 
-    pub fn remove_child(&mut self, parent: Handle, child: Handle) {
-        {
-            let mut nodes = self.nodes.write();
-            let parent = nodes.index_mut(parent);
-            parent.children.swap_remove(parent.children.iter().position(|x| *x == child).unwrap());
-        }
-        self.decrement(child);
+    pub fn children(&self, of: Handle) -> Vec<Handle> {
+        self.object_memory.read().children_of(of)
     }
 
     /// Phase 1 (pre epoch boundary)
@@ -143,7 +171,8 @@ impl<O: ObjectMemory> NodeCollector<O> {
             let mut s = nodes.index_mut(n);
             s.rc -= 1;
             s.rc == 0
-        }; if res {
+        };
+        if res {
             // See comments in Arc about ordering and fence here.
             self.release(n);
         } else {
@@ -151,20 +180,31 @@ impl<O: ObjectMemory> NodeCollector<O> {
         }
     }
 
+    fn apply_operations(&mut self, operations: Vec<CollectorOp>) {
+        for op in operations {
+            match op {
+                CollectorOp::UpCount(handle) => self.increment(handle),
+                CollectorOp::DnCount(handle) => self.decrement(handle),
+            }
+        }
+    }
     fn scan_black(&self, sn: Handle) {
         let mut nodes = self.nodes.write();
         // Recursive function that will just share the same lock guard  as it goes deeper.
         self.scan_black_inner(&mut nodes, sn);
     }
 
-
-    fn scan_black_inner(&self, nodes: &mut RwLockWriteGuard<SlotMap<Handle, NodeHeader>>, sn : Handle) {
+    fn scan_black_inner(
+        &self,
+        nodes: &mut RwLockWriteGuard<SlotMap<Handle, NodeHeader>>,
+        sn: Handle,
+    ) {
         let s = nodes.index_mut(sn);
         if s.color != Color::Black {
             s.color = Color::Black;
-            let children = nodes.get(sn).unwrap().children.clone();
+            let children = self.object_memory.read().children_of(sn);
             for t in children {
-                self.scan_black_inner(nodes,t);
+                self.scan_black_inner(nodes, t);
             }
         }
     }
@@ -181,11 +221,8 @@ impl<O: ObjectMemory> NodeCollector<O> {
     }
 
     pub fn release(&mut self, sn: Handle) {
-        let children = {
-            self.nodes.read().get(sn).unwrap().children.clone()
-        };
+        let children = { self.object_memory.read().children_of(sn) };
         for t in children {
-            assert!(self.nodes.read().contains_key(t));
             self.decrement(t);
         }
         let is_buffered = {
@@ -236,7 +273,6 @@ impl<O: ObjectMemory> NodeCollector<O> {
     }
 
     fn collect_white(&mut self, sn: Handle, current_cycle: &mut Vec<Handle>) {
-
         let made_orange = {
             let mut nodes = self.nodes.write();
             let s = nodes.index_mut(sn);
@@ -250,9 +286,7 @@ impl<O: ObjectMemory> NodeCollector<O> {
         };
         if made_orange {
             current_cycle.push(sn);
-            let children: Vec<Handle> = {
-                self.nodes.read().get(sn).unwrap().children.to_vec()
-            };
+            let children: Vec<Handle> = { self.object_memory.read().children_of(sn) };
             for handle in children {
                 self.collect_white(handle, current_cycle);
             }
@@ -260,26 +294,20 @@ impl<O: ObjectMemory> NodeCollector<O> {
     }
 
     fn sigma_preparation(&mut self) {
-        let cb = {
-            self.cycle_buffer.read().to_owned()
-        };
+        let cb = { self.cycle_buffer.read().to_owned() };
         for c in &cb {
             for n in c {
                 let mut nodes = self.nodes.write();
                 let n = nodes.index_mut(*n);
-                    n.color = Color::Red;
+                n.color = Color::Red;
 
                 // TODO: correct ordering?
                 n.crc = n.rc;
             }
             for n in c {
-                let children = {
-                    self.nodes.read().get(*n).unwrap().children.clone()
-                };
+                let children = { self.object_memory.read().children_of(*n) };
                 for m in children {
-                    let mut nodes = self
-                        .nodes
-                        .write();
+                    let mut nodes = self.nodes.write();
                     let m = nodes.index_mut(m);
                     // TODO: check ordering
                     if m.color == Color::Red && m.crc > 0 {
@@ -363,9 +391,7 @@ impl<O: ObjectMemory> NodeCollector<O> {
             n.color = Color::Red;
         }
         for n in c {
-            let children = {
-                self.nodes.read().get(*n).unwrap().children.clone()
-            };
+            let children = { self.object_memory.read().children_of(*n) };
             for m in children {
                 self.cyclic_decrement(m);
             }
@@ -400,11 +426,10 @@ impl<O: ObjectMemory> NodeCollector<O> {
         let (to_rm_root, to_gray) = {
             let roots = self.roots.read();
             let nodes = self.nodes.read();
-            let (to_gray, to_rm_root): (Vec<Handle>, Vec<Handle>) =
-                roots.iter().partition(|sn| {
-                    let s = nodes.index(**sn);
-                    s.color == Color::Purple && s.rc > 0
-                });
+            let (to_gray, to_rm_root): (Vec<Handle>, Vec<Handle>) = roots.iter().partition(|sn| {
+                let s = nodes.index(**sn);
+                s.color == Color::Purple && s.rc > 0
+            });
 
             (to_rm_root, to_gray)
         };
@@ -418,11 +443,11 @@ impl<O: ObjectMemory> NodeCollector<O> {
         let to_free = to_rm_root.iter().filter(|sn| {
             let mut nodes = self.nodes.write();
             let s = nodes.index_mut(**sn);
-            s.buffered = false ;
+            s.buffered = false;
             s.rc == 0
         });
         let to_free = to_free.copied();
-        let to_free : Vec<Handle> = to_free.collect();
+        let to_free: Vec<Handle> = to_free.collect();
         for sn in to_free {
             self.free(sn);
         }
@@ -437,9 +462,7 @@ impl<O: ObjectMemory> NodeCollector<O> {
             if s.color != Color::Gray {
                 s.color = Color::Gray;
                 s.crc = s.rc;
-                let children = {
-                    nodes.get(sn).unwrap().children.clone()
-                };
+                let children = { self.object_memory.read().children_of(sn) };
                 for t in children {
                     to_gray.push(t);
                 }
@@ -466,7 +489,7 @@ impl<O: ObjectMemory> NodeCollector<O> {
             let s = nodes.index_mut(sn);
             if s.color == Color::Gray && s.crc == 0 {
                 s.color = Color::White;
-                let children = self.nodes.read().get(sn).unwrap().children.clone();
+                let children = { self.object_memory.read().children_of(sn) };
                 for t in children {
                     scan.push(t);
                 }
@@ -497,35 +520,92 @@ impl<O: ObjectMemory> NodeCollector<O> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
-    use std::collections::{HashMap};
+    use core::borrow::BorrowMut;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex, Once};
+    use std::thread::sleep;
+    use std::time::Duration;
 
-    
+    use indexmap::IndexMap;
+    use rand::Rng;
 
-    use crate::{Handle, NodeCollector, ObjectMemory};
+    use threadpool::ThreadPool;
 
+    use crate::CollectorOp::{DnCount, UpCount};
+    use crate::{CollectorOp, Handle, MemMutResult, NodeCollector, ObjectMemory};
+
+    struct TestObj {
+        pub children: HashSet<Handle>,
+    }
+
+    // A very simple mock object memory, that just tracks the list of what's been garbage collected.
     struct TestMem {
+        objects: IndexMap<Handle, TestObj>,
         collected: Vec<Handle>,
+    }
+
+    impl TestMem {
+        fn append_child(&mut self, parent: Handle, child: Handle) {
+            self.objects
+                .get_mut(&parent)
+                .unwrap()
+                .children
+                .insert(child);
+        }
+        fn remove_child(&mut self, parent: Handle, child: Handle) {
+            self.objects
+                .get_mut(&parent)
+                .unwrap()
+                .children
+                .remove(&child);
+        }
     }
 
     impl ObjectMemory for TestMem {
         fn finalize(&mut self, handle: Handle) {
+            self.objects
+                .remove(&handle)
+                .expect("Invalid object reference in finalize");
             self.collected.push(handle);
         }
-        fn created(&mut self, _handle: Handle) {}
+        fn created(&mut self, handle: Handle) -> Option<Vec<CollectorOp>> {
+            self.objects.insert(
+                handle,
+                TestObj {
+                    children: HashSet::new(),
+                },
+            );
+            None
+        }
+        fn children_of(&self, handle: Handle) -> Vec<Handle> {
+            match self.objects.get(&handle) {
+                None => panic!("Could not find children for object"),
+                Some(o) => o.children.iter().copied().collect(),
+            }
+        }
     }
 
     #[test]
     fn test_basic() {
-        let mem = TestMem { collected: vec![] };
+        let mem = TestMem {
+            objects: Default::default(),
+            collected: vec![],
+        };
         let mut collector = NodeCollector::new(mem);
         let a = collector.make();
+        collector.increment(a);
         let b = collector.make();
-        collector.append_child(a, b);
-        collector.increment(a); // A is a root, so starts with an RC of 1
+        collector.with_memory_mut(|m| {
+            m.append_child(a, b);
+            MemMutResult::with_operations(vec![UpCount(b)])
+        });
         collector.process_cycles();
 
         // Should trigger finalization of 'b' as there are no longer any live references.
-        collector.remove_child(a, b);
+        collector.with_memory_mut(|m| {
+            m.remove_child(a, b);
+            MemMutResult::with_operations(vec![DnCount(b)])
+        });
         collector.process_cycles();
 
         assert!(collector.with_memory(|m| m.collected.contains(&b)));
@@ -534,40 +614,160 @@ mod tests {
 
     #[test]
     fn test_simple_cycle() {
-        let mem = TestMem { collected: vec![] };
+        let mem = TestMem {
+            objects: Default::default(),
+            collected: vec![],
+        };
         let mut collector = NodeCollector::new(mem);
         let a = collector.make();
+        collector.increment(a);
         let b = collector.make();
-        collector.append_child(a, b);
-        collector.increment(a); // A is a root, so starts with an RC of 1
+        collector.with_memory_mut(|m| {
+            m.append_child(a, b);
+            MemMutResult::with_operations(vec![UpCount(b)])
+        });
 
         // Form a cycle.
-        collector.append_child(b, a);
+        collector.with_memory_mut(|m| {
+            m.append_child(b, a);
+            MemMutResult::with_operations(vec![UpCount(a)])
+        });
 
         // Should trigger finalization of 'b' as there are no longer any live references.
-        collector.remove_child(a, b);
+        collector.with_memory_mut(|m| {
+            m.remove_child(a, b);
+            MemMutResult::with_operations(vec![DnCount(b)])
+        });
         collector.process_cycles();
 
         assert!(collector.with_memory(|m| m.collected.contains(&b)));
         assert!(!collector.with_memory(|m| m.collected.contains(&a)));
     }
 
-    pub struct MockDB {
-        pub index : HashMap<Handle, usize>,
-        pub objects: Vec<Option<Handle>>,
+    static mut COLLECTOR_GLOBAL: Option<NodeCollector<TestMem>> = None;
+    static INIT: Once = Once::new();
+
+    fn get_collector<'a>() -> &'a NodeCollector<TestMem> {
+        unsafe { COLLECTOR_GLOBAL.as_ref().unwrap() }
     }
 
-    impl ObjectMemory for MockDB {
-        fn finalize(&mut self, handle: Handle) {
-            if let Some(idx) = self.index.get(&handle) {
-                self.objects[*idx] = None;
-            }
-        }
-        fn created(&mut self, handle: Handle) {
-            let idx = self.objects.len();
-            self.objects.push(Some(handle));
-            self.index.insert(handle, idx);
+    fn get_collector_mut<'a>() -> &'a mut NodeCollector<TestMem> {
+        unsafe { COLLECTOR_GLOBAL.as_mut().unwrap() }
+    }
+
+    extern "C" fn gc_create() {
+        let objs = TestMem {
+            objects: Default::default(),
+            collected: vec![],
+        };
+
+        let collector = NodeCollector::new(objs);
+        INIT.call_once(|| unsafe {
+            *COLLECTOR_GLOBAL.borrow_mut() = Some(collector);
+        });
+    }
+
+    unsafe fn produce_bench_object_graph(
+        num_objects: usize,
+        max_child_width: usize,
+        num_mutate_cycles: usize,
+    ) {
+        // Create more objects,
+        for _onum in 0..num_objects {
+            let handle = get_collector_mut().make();
+            get_collector_mut().increment(handle);
         }
 
+        let n_workers = 4;
+        let pool = ThreadPool::new(n_workers);
+
+        let cycle_num = Arc::new(Mutex::new(0));
+
+        let collector_cycle_num = cycle_num;
+        pool.execute(move || {
+            loop {
+                {
+                    let cycle_num = collector_cycle_num.clone();
+                    let mut cycles = cycle_num.lock().unwrap();
+                    if *cycles >= 4 {
+                        break;
+                    }
+                    println!("Executing cycle {}", *cycles);
+                    *cycles += 1;
+                }
+
+                // and collect any cycles
+                get_collector_mut().process_cycles();
+                sleep(Duration::from_secs(10));
+            }
+        });
+
+        for _i in 0..num_mutate_cycles {
+            let num_objects = num_objects;
+            let max_child_width = max_child_width;
+
+            pool.execute(move || {
+                // create random references between them, some of which could (probably) be cycles
+                let parent_child_pairs = get_collector().with_memory(|objs| {
+                    let mut rng = rand::thread_rng();
+                    let mut parent_child_pairs = vec![];
+
+                    for o in objs.objects.iter() {
+                        let num_children = rng.gen_range(0..max_child_width);
+                        for _i in 0..num_children {
+                            let child = objs.objects.get_index(rng.gen_range(0..num_objects));
+                            if let Some(child) = child {
+                                parent_child_pairs.push((*o.0, *child.0));
+                            }
+                        }
+                    }
+                    parent_child_pairs
+                });
+
+                for pair in parent_child_pairs {
+                    get_collector_mut().with_memory_mut(|m| {
+                        m.append_child(pair.0, pair.1);
+                        MemMutResult::with_operations(vec![UpCount(pair.1)])
+                    })
+                }
+                let objs_copy: Vec<Handle> =
+                    get_collector().with_memory(|objs| objs.objects.iter().map(|e| *e.0).collect());
+
+                let mut rng = rand::thread_rng();
+                for o in objs_copy.iter() {
+                    if get_collector().with_memory(|objs| objs.objects.contains_key(o)) {
+                        continue;
+                    }
+
+                    let rand_max_removes = rng.gen_range(0..max_child_width);
+                    for (i, c) in get_collector().children(*o).iter().enumerate() {
+                        if i >= rand_max_removes {
+                            break;
+                        };
+                        let valid_child = get_collector().with_memory(|objs| {
+                            objs.objects.contains_key(o) && objs.objects.contains_key(c)
+                        });
+
+                        if valid_child {
+                            get_collector_mut().with_memory_mut(|m| {
+                                m.remove_child(*o, *c);
+                                MemMutResult::with_operations(vec![DnCount(*c)])
+                            })
+                        }
+                    }
+                }
+            });
+        }
+        pool.join();
+
+        // And then collect last garbage.
+        get_collector_mut().process_cycles();
+    }
+
+    #[test]
+    fn test_mock_obj_graph() {
+        println!("Entering test");
+        gc_create();
+        unsafe { produce_bench_object_graph(10000, 10, 50) };
     }
 }
