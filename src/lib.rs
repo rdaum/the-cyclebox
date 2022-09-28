@@ -9,8 +9,7 @@ use std::hash::Hash;
 
 use atomic_enum::atomic_enum;
 use slotmap::{new_key_type, SlotMap};
-use spin::rwlock::RwLockWriteGuard;
-use spin::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 
 pub trait Collector<O: ObjectMemory> {
     /// Construct an object inside the collector's owned ObjectMemory and register it into the
@@ -154,6 +153,7 @@ impl<O: ObjectMemory> CycleCollector<O> {
             }
         }
     }
+
     fn scan_black(&self, sn: Handle) {
         let mut nodes = self.nodes.write();
         // Recursive function that will just share the same lock guard  as it goes deeper.
@@ -286,17 +286,23 @@ impl<O: ObjectMemory> CycleCollector<O> {
     fn free_cycles(&mut self) {
         let (mut to_free, mut to_refurbish) = (vec![], vec![]);
 
-        // TODO: We're holding a write lock for the whole duration here. This may or may not be necessary
         {
-            let mut cb = self.cycle_buffer.write();
-            for c in cb.iter().rev() {
-                if self.delta_test(c) && self.sigma_test(c) {
+            let cb = {
+                let mut cb = self.cycle_buffer.write();
+                 let new_cb  : Vec<Vec<Handle>> = cb.iter().rev().map(|v| {
+                     v.clone()
+                 }).collect();
+                *cb = vec![];
+                new_cb
+            };
+            for c in cb {
+                if self.delta_test(&c) && self.sigma_test(&c) {
                     to_free.extend(c);
                 } else {
                     to_refurbish.extend(c);
                 }
             }
-            *cb = vec![];
+
         }
         self.free_cycle(&to_free);
         self.refurbish(&to_refurbish);
@@ -343,10 +349,12 @@ impl<O: ObjectMemory> CycleCollector<O> {
     }
 
     fn free_cycle(&mut self, c: &Vec<Handle>) {
-        for n in c {
+        {
             let mut nodes = self.nodes.write();
-            let n = nodes.index_mut(*n);
-            n.color = Color::Red;
+            for n in c {
+                let n = nodes.index_mut(*n);
+                n.color = Color::Red;
+            }
         }
         for n in c {
             let children = { self.object_memory.read().children_of(*n) };
@@ -434,7 +442,9 @@ impl<O: ObjectMemory> CycleCollector<O> {
     }
 
     fn scan_roots(&mut self) {
-        let roots = self.roots.read().to_owned();
+        let roots = {
+            self.roots.read().to_owned()
+        };
         for s in roots {
             self.scan(s);
         }
@@ -470,8 +480,10 @@ impl<O: ObjectMemory> CycleCollector<O> {
     }
 
     fn free(&mut self, handle: Handle) {
+        {
+            self.nodes.write().remove(handle).unwrap();
+        }
         self.object_memory.write().finalize(handle);
-        self.nodes.write().remove(handle).unwrap();
     }
 }
 
@@ -484,6 +496,7 @@ impl<O: ObjectMemory> Collector<O> for CycleCollector<O> {
         }
         handle
     }
+
     /// Perform some function with the object memory owned by the collector.
     /// Function is given an immutable reference to the memory.
     fn with_memory<F, R>(&self, f: F) -> R
@@ -493,6 +506,7 @@ impl<O: ObjectMemory> Collector<O> for CycleCollector<O> {
         let m = self.object_memory.read();
         f(&m)
     }
+
     /// Perform some mutating function with the object memory owned by the collector.
     /// Function is given an immutable reference to the memory, and should return a series
     /// of collector operations (e.g. upcount, downcounts) that should be applied by the collector
@@ -512,9 +526,11 @@ impl<O: ObjectMemory> Collector<O> for CycleCollector<O> {
 
         result.result
     }
+
     fn children(&self, of: Handle) -> Vec<Handle> {
         self.object_memory.read().children_of(of)
     }
+
     /// Phase 1 (pre epoch boundary)
     fn increment(&mut self, sn: Handle) {
         {
@@ -525,6 +541,7 @@ impl<O: ObjectMemory> Collector<O> for CycleCollector<O> {
         }
         self.scan_black(sn);
     }
+
     fn decrement(&mut self, n: Handle) {
         let res = {
             let mut nodes = self.nodes.write();

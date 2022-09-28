@@ -12,9 +12,9 @@ use criterion::Criterion;
 use cyclebox::CollectorOp::{DnCount, UpCount};
 use cyclebox::{CollectorOp, Handle, MemMutResult, CycleCollector, ObjectMemory, Collector};
 use indexmap::IndexMap;
+use parking_lot::Mutex;
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
-use spin::Mutex;
 use threadpool::ThreadPool;
 
 struct TestObj {
