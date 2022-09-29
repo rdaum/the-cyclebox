@@ -150,7 +150,7 @@ unsafe fn concurrent_produce_bench_object_graph(
                 })
             }
             let objs_copy: Vec<Handle> =
-                get_collector().with_memory(|objs| objs.objects.iter().map(|e| *e.0).collect());
+                get_collector().with_memory(|objs| objs.objects.keys().copied().collect());
 
             let mut rng = rand::thread_rng();
             for o in objs_copy.iter() {
@@ -224,7 +224,7 @@ unsafe fn produce_bench_object_graph(
             })
         }
         let objs_copy: Vec<Handle> =
-            get_collector().with_memory(|objs| objs.objects.iter().map(|e| *e.0).collect());
+            get_collector().with_memory(|objs| objs.objects.keys().copied().collect());
 
         let mut rng = rand::thread_rng();
         for o in objs_copy.iter() {

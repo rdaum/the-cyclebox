@@ -6,6 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
 use std::hash::Hash;
+use std::ops::{DerefMut};
 
 use atomic_enum::atomic_enum;
 use slotmap::{new_key_type, SlotMap};
@@ -33,10 +34,10 @@ pub trait Collector<O: ObjectMemory> {
     /// Increase the reference count of a given object known to the collector.
     fn increment(&mut self, sn: Handle);
 
-    /// Decreate the reference count of a given object known to the collector.
+    /// Decrement the reference count of a given object known to the collector.
     fn decrement(&mut self, n: Handle);
 
-    /// Go through, find any objects being kept alive due to cycles, and clean them, up.
+    /// Go through, find any objects being kept alive due to cycles, and clean them up.
     fn process_cycles(&mut self);
 }
 
@@ -207,9 +208,7 @@ impl<O: ObjectMemory> CycleCollector<O> {
     fn collect_roots(&mut self) {
         let roots = {
             let mut roots = self.roots.write();
-            let roots_copy = roots.to_owned();
-            (*roots).clear();
-            roots_copy
+            std::mem::take(roots.deref_mut())
         };
         for sn in roots {
             let is_white = {
@@ -259,7 +258,6 @@ impl<O: ObjectMemory> CycleCollector<O> {
                 let n = nodes.index_mut(*n);
                 n.color = Color::Red;
 
-                // TODO: correct ordering?
                 n.crc = n.rc;
             }
             for n in c {
@@ -267,7 +265,6 @@ impl<O: ObjectMemory> CycleCollector<O> {
                 for m in children {
                     let mut nodes = self.nodes.write();
                     let m = nodes.index_mut(m);
-                    // TODO: check ordering
                     if m.color == Color::Red && m.crc > 0 {
                         m.crc -= 1;
                     }
@@ -289,14 +286,11 @@ impl<O: ObjectMemory> CycleCollector<O> {
         {
             let cb = {
                 let mut cb = self.cycle_buffer.write();
-                 let new_cb  : Vec<Vec<Handle>> = cb.iter().rev().map(|v| {
-                     v.clone()
-                 }).collect();
-                *cb = vec![];
+                let new_cb = std::mem::take(cb.deref_mut());
                 new_cb
             };
-            for c in cb {
-                if self.delta_test(&c) && self.sigma_test(&c) {
+            for c in cb.iter().rev() {
+                if self.delta_test(c) && self.sigma_test(c) {
                     to_free.extend(c);
                 } else {
                     to_refurbish.extend(c);
@@ -304,8 +298,8 @@ impl<O: ObjectMemory> CycleCollector<O> {
             }
 
         }
-        self.free_cycle(&to_free);
-        self.refurbish(&to_refurbish);
+        self.free_cycle(to_free);
+        self.refurbish(to_refurbish);
     }
 
     fn delta_test(&self, c: &Vec<Handle>) -> bool {
@@ -330,15 +324,15 @@ impl<O: ObjectMemory> CycleCollector<O> {
         extern_rc == 0
     }
 
-    fn refurbish(&mut self, c: &Vec<Handle>) {
+    fn refurbish(&mut self, c: Vec<Handle>) {
         let mut first = false;
         for nn in c {
             let mut nodes = self.nodes.write();
             {
-                let n = nodes.index_mut(*nn);
+                let n = nodes.index_mut(nn);
                 if (first && n.color == Color::Orange) || n.color == Color::Purple {
                     n.color = Color::Purple;
-                    self.roots.write().push(*nn);
+                    self.roots.write().push(nn);
                 } else {
                     n.color = Color::Black;
                     n.buffered = false;
@@ -348,22 +342,22 @@ impl<O: ObjectMemory> CycleCollector<O> {
         }
     }
 
-    fn free_cycle(&mut self, c: &Vec<Handle>) {
+    fn free_cycle(&mut self, c: Vec<Handle>) {
         {
             let mut nodes = self.nodes.write();
-            for n in c {
+            for n in &c {
                 let n = nodes.index_mut(*n);
                 n.color = Color::Red;
             }
         }
-        for n in c {
+        for n in &c {
             let children = { self.object_memory.read().children_of(*n) };
             for m in children {
                 self.cyclic_decrement(m);
             }
         }
         for n in c {
-            self.free(*n);
+            self.free(n);
         }
     }
 
@@ -406,13 +400,12 @@ impl<O: ObjectMemory> CycleCollector<O> {
         for s in to_gray.iter() {
             self.mark_gray(*s);
         }
-        let to_free = to_rm_root.iter().filter(|sn| {
+        let to_free = to_rm_root.into_iter().filter(|sn| {
             let mut nodes = self.nodes.write();
-            let s = nodes.index_mut(**sn);
+            let s = nodes.index_mut(*sn);
             s.buffered = false;
             s.rc == 0
         });
-        let to_free = to_free.copied();
         let to_free: Vec<Handle> = to_free.collect();
         for sn in to_free {
             self.free(sn);
@@ -780,7 +773,7 @@ mod tests {
                     })
                 }
                 let objs_copy: Vec<Handle> =
-                    get_collector().with_memory(|objs| objs.objects.iter().map(|e| *e.0).collect());
+                    get_collector().with_memory(|objs| objs.objects.keys().copied().collect());
 
                 let mut rng = rand::thread_rng();
                 for o in objs_copy.iter() {
