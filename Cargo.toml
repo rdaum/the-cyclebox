@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-slotmap = { version = "1.0.6" }
+sharded-slab = "0.1.4"
 atomic_enum = "0.2.0"
 parking_lot = "0.12.1"
 seqlock = "0.1.2"
