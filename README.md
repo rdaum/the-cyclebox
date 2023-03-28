@@ -1,5 +1,10 @@
 # the cyclebox
 
+### STATUS: stalled, until I get time to come back to this and fix a number of things.
+
+  * Finish writing the benchmarks and correctness tests I was working on 
+  * Completely rework the use of atomics (and locks) throughout this. 
+  
 ### what am i?
 
   * A simple lightweight reference counting concurrent garbage collector implementation that 
